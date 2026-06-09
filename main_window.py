@@ -13,7 +13,7 @@ import os
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -42,8 +42,18 @@ from PySide6.QtWidgets import (
 from command_manager import STANDARD_BAUDRATES, CommandManager
 from data_buffer import DataBuffer, SignalStats
 from plot_manager import PlotManager
-from serial_manager import SerialManager, list_serial_ports
-from signals_config import KNOWN_SIGNALS, SIGNAL_LABELS
+from serial_manager import SerialManager, list_serial_ports, parse_data_line
+from median_filter import MedianFilter
+from signals_config import (
+    DEFAULT_RIGHT_MARGIN,
+    DEFAULT_VI,
+    DEFAULT_VS,
+    KNOWN_SIGNALS,
+    SIGNAL_ADC,
+    SIGNAL_LABELS,
+    SIGNAL_VOLTIOS,
+)
+from voltage_converter import VoltageConverter
 
 
 # Opciones predefinidas de ventana temporal (segundos).
@@ -67,13 +77,23 @@ class MainWindow(QMainWindow):
         self.resize(1400, 900)
 
         # Módulos centrales.
+        self._voltage_converter = VoltageConverter()
+        self._median_filter = MedianFilter(maxlen=9, enabled=False)
         self._serial = SerialManager()
-        self._buffer = DataBuffer()
+        self._buffer = DataBuffer(
+            converter=self._voltage_converter,
+            median_filter=self._median_filter,
+        )
         self._plot = PlotManager()
+        self._plot.set_right_margin(DEFAULT_RIGHT_MARGIN)
         self._commands = CommandManager()
 
         # Checkboxes fijos para ADC y Voltios.
         self._signal_checkboxes: Dict[str, QCheckBox] = {}
+
+        # Cola de muestras pendientes (evita bloquear la UI con cada línea serial).
+        self._pending_samples: List[tuple[float, float]] = []
+        self._max_pending_samples = 50_000
 
         self._setup_ui()
         self._setup_fixed_signal_checkboxes()
@@ -107,8 +127,10 @@ class MainWindow(QMainWindow):
         left_panel.setSpacing(6)
         left_panel.addWidget(self._build_connection_panel())
         left_panel.addWidget(self._build_time_panel())
+        left_panel.addWidget(self._build_voltage_panel())
         left_panel.addWidget(self._build_y_panel())
         left_panel.addWidget(self._build_signals_panel())
+        left_panel.addWidget(self._build_filter_panel())
         left_panel.addWidget(self._build_recording_panel())
         left_panel.addWidget(self._build_command_panel())
         left_panel.addStretch()
@@ -126,8 +148,9 @@ class MainWindow(QMainWindow):
         center_panel = QVBoxLayout()
         center_panel.addWidget(self._plot)
 
-        # Panel derecho: estadísticas + consola.
+        # Panel derecho: vista, estadísticas + consola.
         right_panel = QVBoxLayout()
+        right_panel.addWidget(self._build_view_panel())
         right_panel.addWidget(self._build_stats_panel())
         right_panel.addWidget(self._build_console_panel())
 
@@ -271,6 +294,121 @@ class MainWindow(QMainWindow):
         self._grid_check = QCheckBox("Mostrar cuadrícula")
         self._grid_check.setChecked(True)
         layout.addWidget(self._grid_check)
+
+        return group
+
+    def _build_voltage_panel(self) -> QGroupBox:
+        """
+        Panel de conversión ADC → Voltios.
+
+        Aquí se configuran Vi, Vs y el centro ADC. Pulse 'Aplicar' para activar.
+        """
+        group = QGroupBox("Conversión ADC → Voltios")
+        layout = QVBoxLayout(group)
+
+        hint = QLabel(
+            "El Arduino envía solo ADC (0–1023).\n"
+            "Fórmula (archivo voltage_converter.py):\n"
+            "V = Vi + (ADC × (Vs − Vi) / 1023)"
+        )
+        hint.setStyleSheet("color: #888; font-size: 11px;")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        form = QFormLayout()
+
+        self._vi_spin = QDoubleSpinBox()
+        self._vi_spin.setRange(-100.0, 100.0)
+        self._vi_spin.setDecimals(3)
+        self._vi_spin.setSuffix(" V")
+        self._vi_spin.setValue(DEFAULT_VI)
+        self._vi_spin.setToolTip("Vinferior (Vmin): voltaje cuando ADC = 0")
+        form.addRow("Vi (Vmin):", self._vi_spin)
+
+        self._vs_spin = QDoubleSpinBox()
+        self._vs_spin.setRange(-100.0, 100.0)
+        self._vs_spin.setDecimals(3)
+        self._vs_spin.setSuffix(" V")
+        self._vs_spin.setValue(DEFAULT_VS)
+        self._vs_spin.setToolTip("Vsuperior (Vmax): voltaje cuando ADC = 1023")
+        form.addRow("Vs (Vmax):", self._vs_spin)
+
+        layout.addLayout(form)
+
+        self._apply_voltage_btn = QPushButton("Aplicar conversión")
+        self._apply_voltage_btn.setStyleSheet(
+            "QPushButton { background: #1565c0; color: white; font-weight: bold; }"
+        )
+        layout.addWidget(self._apply_voltage_btn)
+
+        self._voltage_formula_label = QLabel(self._voltage_converter.formula_description())
+        self._voltage_formula_label.setStyleSheet("color: #69f0ae; font-size: 10px;")
+        self._voltage_formula_label.setWordWrap(True)
+        layout.addWidget(self._voltage_formula_label)
+
+        return group
+
+    def _build_view_panel(self) -> QGroupBox:
+        """Panel derecho: margen de visualización en el eje temporal."""
+        group = QGroupBox("Vista de la gráfica")
+        layout = QVBoxLayout(group)
+
+        hint = QLabel(
+            "Margen derecho: espacio vacío después del último dato "
+            "para ver cómo avanza la señal."
+        )
+        hint.setStyleSheet("color: #888; font-size: 11px;")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        margin_row = QHBoxLayout()
+        self._right_margin_spin = QDoubleSpinBox()
+        self._right_margin_spin.setRange(0.0, 60.0)
+        self._right_margin_spin.setDecimals(2)
+        self._right_margin_spin.setSuffix(" s")
+        self._right_margin_spin.setValue(DEFAULT_RIGHT_MARGIN)
+        self._right_margin_spin.setToolTip("Segundos de espacio vacío a la derecha")
+        self._apply_margin_btn = QPushButton("Aplicar")
+        margin_row.addWidget(self._right_margin_spin)
+        margin_row.addWidget(self._apply_margin_btn)
+        layout.addLayout(margin_row)
+
+        return group
+
+    def _build_filter_panel(self) -> QGroupBox:
+        """Panel del filtro mediana sobre el ADC."""
+        group = QGroupBox("Filtro mediana (ruido)")
+        layout = QVBoxLayout(group)
+
+        hint = QLabel(
+            "Suaviza el ADC antes de convertir a voltios.\n"
+            "Use ventana impar (ej: 5, 9, 11)."
+        )
+        hint.setStyleSheet("color: #888; font-size: 11px;")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        maxlen_row = QHBoxLayout()
+        self._median_maxlen_spin = QSpinBox()
+        self._median_maxlen_spin.setRange(3, 101)
+        self._median_maxlen_spin.setSingleStep(2)
+        self._median_maxlen_spin.setValue(9)
+        self._median_maxlen_spin.setToolTip("Tamaño de ventana (impar recomendado)")
+        maxlen_row.addWidget(QLabel("maxlen:"))
+        maxlen_row.addWidget(self._median_maxlen_spin)
+        layout.addLayout(maxlen_row)
+
+        btn_row = QHBoxLayout()
+        self._median_apply_btn = QPushButton("Aplicar filtro")
+        self._median_remove_btn = QPushButton("Quitar filtro")
+        self._median_remove_btn.setEnabled(False)
+        btn_row.addWidget(self._median_apply_btn)
+        btn_row.addWidget(self._median_remove_btn)
+        layout.addLayout(btn_row)
+
+        self._median_status_label = QLabel("Filtro: desactivado")
+        self._median_status_label.setStyleSheet("color: #888;")
+        layout.addWidget(self._median_status_label)
 
         return group
 
@@ -418,6 +556,14 @@ class MainWindow(QMainWindow):
         self._apply_y_btn.clicked.connect(self._on_apply_y_manual)
         self._grid_check.toggled.connect(self._plot.set_grid_visible)
 
+        # Conversión de voltaje.
+        self._apply_voltage_btn.clicked.connect(self._on_apply_voltage_params)
+        self._apply_margin_btn.clicked.connect(self._on_apply_right_margin)
+
+        # Filtro mediana.
+        self._median_apply_btn.clicked.connect(self._on_apply_median_filter)
+        self._median_remove_btn.clicked.connect(self._on_remove_median_filter)
+
         # Señales.
         self._show_all_signals_btn.clicked.connect(self._on_show_all_signals)
         self._hide_all_signals_btn.clicked.connect(self._on_hide_all_signals)
@@ -481,22 +627,87 @@ class MainWindow(QMainWindow):
             self._conn_status_label.setStyleSheet("color: #ef5350; font-weight: bold;")
 
     def _on_data_received(self, values: dict, timestamp: float) -> None:
-        self._buffer.add_sample(values, timestamp)
-        self._status_bar.showMessage(
-            f"Recibiendo datos — {self._buffer.sample_count:,} muestras | "
-            f"{self._buffer.sample_rate_hz:.0f} Hz"
-        )
+        # Encolar muestra; se procesa en lote en _refresh_plot (no bloquea la UI).
+        adc = values.get("ADC")
+        if adc is None:
+            return
+        self._pending_samples.append((float(adc), timestamp))
+        if len(self._pending_samples) > self._max_pending_samples:
+            self._pending_samples = self._pending_samples[-self._max_pending_samples:]
+
+    def _flush_pending_samples(self) -> None:
+        """Vuelca la cola de muestras al buffer en una sola operación."""
+        if not self._pending_samples:
+            return
+        batch = self._pending_samples
+        self._pending_samples = []
+        self._buffer.add_samples_batch(batch)
 
     def _on_raw_line(self, line: str) -> None:
-        # Manejar líneas de protocolo antes de mostrar en consola.
         if self._commands.handle_response_line(line):
             self._append_console(f"[PROTO] {line}")
+            return
+        # No volcar cada lectura ADC a la consola: con alta frecuencia congela la UI.
+        if parse_data_line(line) is not None:
             return
         self._append_console(line)
 
     def _on_error(self, message: str) -> None:
         self._status_bar.showMessage(f"Error: {message}")
         self._append_console(f"[ERROR] {message}")
+
+    # ------------------------------------------------------------------
+    # Conversión de voltaje y vista
+    # ------------------------------------------------------------------
+
+    def _on_apply_voltage_params(self) -> None:
+        """Aplica Vi y Vs; recalcula todo el historial de Voltios."""
+        vi = self._vi_spin.value()
+        vs = self._vs_spin.value()
+
+        if vi >= vs:
+            QMessageBox.warning(
+                self,
+                "Parámetros inválidos",
+                "Vi (Vmin) debe ser menor que Vs (Vmax).",
+            )
+            return
+
+        self._voltage_converter.set_params(vi, vs)
+        self._buffer.set_converter(self._voltage_converter)
+        self._voltage_formula_label.setText(self._voltage_converter.formula_description())
+        self._status_bar.showMessage(f"Conversión aplicada: Vi={vi} V, Vs={vs} V")
+        self._refresh_plot()
+
+    def _on_apply_median_filter(self) -> None:
+        """Activa el filtro mediana con el maxlen indicado."""
+        maxlen = self._median_maxlen_spin.value() | 1
+        self._median_maxlen_spin.setValue(maxlen)
+        self._buffer.set_median_filter(maxlen, enabled=True)
+        self._median_apply_btn.setEnabled(False)
+        self._median_remove_btn.setEnabled(True)
+        self._median_maxlen_spin.setEnabled(False)
+        self._median_status_label.setText(f"Filtro: ACTIVO (ventana={maxlen})")
+        self._median_status_label.setStyleSheet("color: #69f0ae; font-weight: bold;")
+        self._status_bar.showMessage(f"Filtro mediana activado (maxlen={maxlen})")
+
+    def _on_remove_median_filter(self) -> None:
+        """Desactiva el filtro mediana."""
+        maxlen = self._median_maxlen_spin.value()
+        self._buffer.set_median_filter(maxlen, enabled=False)
+        self._median_apply_btn.setEnabled(True)
+        self._median_remove_btn.setEnabled(False)
+        self._median_maxlen_spin.setEnabled(True)
+        self._median_status_label.setText("Filtro: desactivado")
+        self._median_status_label.setStyleSheet("color: #888;")
+        self._status_bar.showMessage("Filtro mediana desactivado")
+
+    def _on_apply_right_margin(self) -> None:
+        """Aplica el margen derecho de la gráfica."""
+        margin = self._right_margin_spin.value()
+        self._plot.set_right_margin(margin)
+        self._status_bar.showMessage(f"Margen derecho: {margin:.2f} s")
+        self._refresh_plot()
 
     # ------------------------------------------------------------------
     # Señales fijas: ADC y Voltios
@@ -573,6 +784,8 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _refresh_plot(self) -> None:
+        self._flush_pending_samples()
+
         enabled = [
             name for name, cb in self._signal_checkboxes.items() if cb.isChecked()
         ]
@@ -587,14 +800,37 @@ class MainWindow(QMainWindow):
                 self._plot.pan_offset,
                 enabled,
             )
+
+        self._update_y_axis_label(enabled)
         self._plot.update_plot(ts, data, y_range)
+
+    def _update_y_axis_label(self, enabled: List[str]) -> None:
+        """Etiqueta del eje Y acorde a la señal que se está viendo."""
+        if enabled == [SIGNAL_VOLTIOS]:
+            self._plot.set_y_label("Voltios", "V")
+        elif enabled == [SIGNAL_ADC]:
+            self._plot.set_y_label("ADC")
+        elif SIGNAL_VOLTIOS in enabled and SIGNAL_ADC not in enabled:
+            self._plot.set_y_label("Voltios", "V")
+        elif SIGNAL_ADC in enabled and SIGNAL_VOLTIOS not in enabled:
+            self._plot.set_y_label("ADC")
+        else:
+            self._plot.set_y_label("Valor")
         self._pan_offset_label.setText(f"Offset: {self._plot.pan_offset:.1f} s")
 
     def _refresh_stats(self) -> None:
+        self._flush_pending_samples()
+
         stats = self._buffer.get_stats()
-        self._sample_rate_label.setText(f"Frecuencia: {self._buffer.sample_rate_hz:.1f} Hz")
-        self._sample_count_label.setText(f"Muestras: {self._buffer.sample_count:,}")
+        rate = self._buffer.sample_rate_hz
+        count = self._buffer.sample_count
+        self._sample_rate_label.setText(f"Frecuencia: {rate:.1f} Hz")
+        self._sample_count_label.setText(f"Muestras: {count:,}")
         self._duration_label.setText(f"Duración: {self._buffer.duration:.1f} s")
+        if count > 0:
+            self._status_bar.showMessage(
+                f"Recibiendo datos — {count:,} muestras | {rate:.0f} Hz"
+            )
 
         visible_stats = {
             name: s for name, s in stats.items()
@@ -745,10 +981,22 @@ class MainWindow(QMainWindow):
         if self._console.document().blockCount() > 500:
             self._console.clear()
 
+    def changeEvent(self, event) -> None:
+        """Pausa actualizaciones al minimizar para evitar que la ventana se cuelgue."""
+        if event.type() == QEvent.Type.WindowStateChange:
+            if self.isMinimized():
+                self._plot_timer.stop()
+                self._stats_timer.stop()
+            else:
+                self._plot_timer.start(33)
+                self._stats_timer.start(500)
+        super().changeEvent(event)
+
     def closeEvent(self, event) -> None:
         """Detiene timers y libera el puerto COM antes de cerrar."""
         self._plot_timer.stop()
         self._stats_timer.stop()
+        self._flush_pending_samples()
         if self._serial.is_connected:
             self._serial.disconnect()
         event.accept()

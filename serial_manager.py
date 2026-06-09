@@ -2,8 +2,7 @@
 serial_manager.py — Comunicación serial en hilo independiente.
 
 Lee el puerto serial en un QThread para no bloquear la interfaz gráfica.
-Analiza líneas con formato:  ADC:<valor>\\tVoltios:<valor>
-y emite señales Qt con los datos parseados y el estado de conexión.
+El Arduino envía solo el valor ADC (0–1023) por línea.
 """
 
 from __future__ import annotations
@@ -16,14 +15,10 @@ import serial
 import serial.tools.list_ports
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
-from signals_config import ADC_MAX, ADC_SCALE_FACTOR, SIGNAL_ADC, SIGNAL_VOLTIOS
+from signals_config import ADC_MAX, SIGNAL_ADC
 
-# Solo acepta el formato exacto del firmware:  ADC:5.9\tVoltios:0.401
-_STRICT_DATA_PATTERN = re.compile(
-    r"^ADC:([+\-]?\d*\.?\d+(?:[eE][+\-]?\d+)?)"
-    r"[\t ]+"
-    r"Voltios:([+\-]?\d*\.?\d+(?:[eE][+\-]?\d+)?)\s*$"
-)
+# Formatos aceptados: "512" o "ADC:512"
+_ADC_LINE_PATTERN = re.compile(r"^(?:ADC:)?(\d{1,4})\s*$", re.IGNORECASE)
 
 
 def list_serial_ports() -> List[str]:
@@ -52,7 +47,6 @@ class SerialReaderThread(QThread):
         buffer = ""
         while self._running:
             try:
-                # Leer bytes disponibles; si no hay, leer 1 byte con timeout del puerto.
                 waiting = self._port.in_waiting
                 raw = self._port.read(waiting if waiting > 0 else 1)
                 if not raw:
@@ -84,33 +78,30 @@ class SerialReaderThread(QThread):
 
 def parse_data_line(line: str) -> Optional[Dict[str, float]]:
     """
-    Analiza una línea de datos del Arduino.
+    Analiza una línea con el valor ADC enviado por Arduino.
 
-    Formato estricto esperado:
-      ADC:5.9\\tVoltios:0.401
+    Formatos aceptados:
+      512
+      ADC:512
 
-    El ADC en serie viene como adc/100 (ej: 5.1 → ADC 510).
-    Líneas corruptas o con nombres distintos se descartan.
-
-    :returns: Diccionario {ADC, Voltios} o None si no es válida.
+    :returns: Diccionario {ADC: valor} o None si la línea no es válida.
     """
     if not line or line.startswith("#") or line.startswith("ACK_") or line.startswith("ERR_"):
         return None
 
-    match = _STRICT_DATA_PATTERN.match(line.strip().rstrip("\r"))
+    match = _ADC_LINE_PATTERN.match(line.strip().rstrip("\r"))
     if not match:
         return None
 
     try:
-        adc_scaled = float(match.group(1))
-        voltios = float(match.group(2))
+        adc = int(match.group(1))
     except ValueError:
         return None
 
-    # Reconstruir ADC real en rango 0–1023 a partir de adc/100 enviado por Arduino.
-    adc_raw = max(0.0, min(ADC_MAX, adc_scaled * ADC_SCALE_FACTOR))
+    if adc < 0 or adc > int(ADC_MAX):
+        return None
 
-    return {SIGNAL_ADC: adc_raw, SIGNAL_VOLTIOS: voltios}
+    return {SIGNAL_ADC: float(adc)}
 
 
 class SerialManager(QObject):
@@ -171,7 +162,6 @@ class SerialManager(QObject):
             self._baudrate = baudrate
             self._port_name = port_name
 
-            # Esperar reset del Arduino tras apertura del puerto (DTR) y limpiar buffers.
             time.sleep(0.3)
             try:
                 self._port.reset_input_buffer()
@@ -195,12 +185,7 @@ class SerialManager(QObject):
             return False
 
     def _release_port(self, port: Optional[serial.Serial]) -> None:
-        """
-        Libera completamente un puerto serial (especialmente en Windows).
-
-        Cierra buffers, desactiva líneas de control y fuerza el cierre del handle
-        para que otros programas (p. ej. Arduino IDE) puedan usar el COM.
-        """
+        """Libera completamente un puerto serial."""
         if port is None:
             return
 
@@ -211,14 +196,11 @@ class SerialManager(QObject):
                     port.reset_output_buffer()
                 except serial.SerialException:
                     pass
-
-                # Desactivar DTR/RTS para no mantener el dispositivo ocupado.
                 try:
                     port.dtr = False
                     port.rts = False
                 except serial.SerialException:
                     pass
-
                 port.close()
         except serial.SerialException:
             pass
@@ -239,11 +221,7 @@ class SerialManager(QObject):
 
         try:
             if reader is not None:
-                # Detener el hilo; no desconectar señales Qt manualmente
-                # porque eso puede impedir que la próxima conexión reciba datos.
                 reader.stop()
-
-            # Cerrar el puerto tras detener el hilo para liberar el COM.
             self._release_port(port)
         finally:
             self._disconnecting = False
@@ -253,11 +231,7 @@ class SerialManager(QObject):
 
     @Slot(str)
     def send_command(self, command: str) -> bool:
-        """
-        Envía un comando de texto al Arduino (añade \\n si falta).
-
-        :returns: True si el envío fue exitoso.
-        """
+        """Envía un comando de texto al Arduino (añade \\n si falta)."""
         if not self.is_connected or self._port is None:
             self.error_occurred.emit("No hay conexión activa para enviar comandos")
             return False
@@ -289,5 +263,5 @@ class SerialManager(QObject):
     def reopen(self, port_name: str, baudrate: int) -> bool:
         """Cierra y reabre el puerto (útil tras cambio de baudrate)."""
         self.disconnect()
-        time.sleep(0.3)  # Esperar a que Arduino reinicie su UART
+        time.sleep(0.3)
         return self.connect(port_name, baudrate)

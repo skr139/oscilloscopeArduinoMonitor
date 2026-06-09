@@ -49,6 +49,7 @@ class PlotManager(QWidget):
         # Estado de la ventana temporal.
         self._window_seconds = 10.0
         self._pan_offset = 0.0
+        self._right_margin = 0.0  # Espacio vacío a la derecha del dato vivo
 
         # Estado del eje Y.
         self._auto_y = True
@@ -88,6 +89,10 @@ class PlotManager(QWidget):
     @property
     def pan_offset(self) -> float:
         return self._pan_offset
+
+    @property
+    def right_margin(self) -> float:
+        return self._right_margin
 
     @property
     def auto_y(self) -> bool:
@@ -165,6 +170,14 @@ class PlotManager(QWidget):
         """Vuelve a la vista en tiempo real (sin desplazamiento)."""
         self._pan_offset = 0.0
 
+    def set_right_margin(self, seconds: float) -> None:
+        """
+        Margen vacío a la derecha del último dato (segundos).
+
+        Permite ver la señal avanzar sin pegarse al borde derecho de la gráfica.
+        """
+        self._right_margin = max(0.0, seconds)
+
     def zoom_x_in(self, factor: float = 0.5) -> None:
         """Reduce la ventana temporal (zoom-in horizontal)."""
         self._window_seconds = max(0.1, self._window_seconds * factor)
@@ -216,6 +229,10 @@ class PlotManager(QWidget):
         self._show_grid = visible
         self._plot_widget.showGrid(x=visible, y=visible, alpha=0.3)
 
+    def set_y_label(self, text: str, units: str = "") -> None:
+        """Actualiza la etiqueta del eje Y según la señal visible."""
+        self._plot_widget.setLabel("left", text, units=units)
+
     # ------------------------------------------------------------------
     # Actualización de la gráfica
     # ------------------------------------------------------------------
@@ -253,8 +270,9 @@ class PlotManager(QWidget):
             curve.setVisible(True)
             curve.setData(timestamps, values)
 
-        # Configurar rango del eje X.
-        t_end = timestamps[-1]
+        # Eje X: margen derecho deja espacio vacío tras el último punto.
+        t_live = float(timestamps[-1]) - self._pan_offset
+        t_end = t_live + self._right_margin
         t_start = t_end - self._window_seconds
         self._plot_widget.setXRange(t_start, t_end, padding=0)
 

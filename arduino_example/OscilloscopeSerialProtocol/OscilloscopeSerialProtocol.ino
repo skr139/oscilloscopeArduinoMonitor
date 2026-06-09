@@ -7,10 +7,12 @@
  * ========================================
  *
  * 1. DATOS DE SENSOR (PC <- Arduino)
- *    Formato por línea:
- *      ADC:<valor>\tVoltios:<valor>\n
- *    Ejemplo:
- *      ADC:5.1\tVoltios:-0.039
+ *    Formato por línea (solo ADC entero 0–1023):
+ *      512
+ *    o también:
+ *      ADC:512
+ *
+ *    La conversión a voltios la hace la aplicación Python con Vi, Vs y ADC_centro.
  *
  * 2. CAMBIO DE BAUDRATE (PC -> Arduino -> PC)
  *    La PC NO puede cambiar el baudrate unilateralmente. Ambos lados deben
@@ -94,15 +96,12 @@ void loop() {
 // Envío de datos de sensor
 // ----------------------------------------------------------------
 void sendSample() {
-  // Simular señales (reemplazar con analogRead u otro sensor real).
+  // Simular señal (reemplazar con analogRead u otro sensor real).
   simulatedADC = 512.0 + 200.0 * sin(millis() / 500.0) + random(-5, 6);
-  simulatedVolts = (simulatedADC / 1023.0) * 5.0 - 2.5;
+  int adc = constrain((int)simulatedADC, 0, 1023);
 
-  // Formato requerido por la aplicación Python.
-  Serial.print("ADC:");
-  Serial.print(simulatedADC, 1);
-  Serial.print("\tVoltios:");
-  Serial.println(simulatedVolts, 3);
+  // La app Python convierte ADC → Voltios con Vi, Vs y centro configurables.
+  Serial.println(adc);
 }
 
 // ----------------------------------------------------------------
