@@ -222,41 +222,88 @@ class DataBuffer:
             return 0
 
         with self._lock:
-            added = 0
+            n = len(samples)
+            if n == 0:
+                return 0
 
-            for adc_raw, recv_ts in samples:
-                if self._start_time is None:
-                    self._start_time = recv_ts
+            if self._start_time is None:
+                self._start_time = samples[0][1]
 
-                relative_t = recv_ts - self._start_time
-                adc, voltios = self._process_adc(adc_raw)
+            ts_abs = np.fromiter((s[1] for s in samples), dtype=np.float64, count=n)
+            relative_ts = ts_abs - self._start_time
 
-                if self._count >= self._capacity:
-                    self._grow()
+            # Filtro mediana requiere secuencia; el resto es vectorizado.
+            adc_raw = np.fromiter((s[0] for s in samples), dtype=np.float64, count=n)
+            adc_raw = np.clip(adc_raw, 0.0, ADC_MAX)
 
-                idx = self._count
-                self._timestamps[idx] = relative_t
-                self._signals[SIGNAL_ADC][idx] = adc
-                self._signals[SIGNAL_VOLTIOS][idx] = voltios
+            if self._median_filter.enabled:
+                adc = np.empty(n, dtype=np.float64)
+                for i in range(n):
+                    adc[i] = self._median_filter.filter(float(adc_raw[i]))
+            else:
+                adc = adc_raw
 
-                self._count += 1
-                added += 1
+            p = self._converter.params
+            voltios = p.vi + (adc * p.span / ADC_MAX)
+            voltios = np.clip(voltios, p.vi, p.vs)
 
-                if self._recording:
-                    self._record_timestamps.append(recv_ts)
-                    self._record_signals.setdefault(SIGNAL_ADC, []).append(adc)
-                    self._record_signals.setdefault(SIGNAL_VOLTIOS, []).append(
-                        self._signals[SIGNAL_VOLTIOS][idx]
-                    )
+            # Asegurar espacio. Si se alcanza el límite, _grow descarta datos
+            # antiguos; recalculamos en cada vuelta para no quedar en bucle.
+            while self._count + n > self._capacity:
+                prev_cap = self._capacity
+                self._grow()
+                if self._capacity == prev_cap:
+                    # No se puede crecer más: conservar solo lo más reciente del lote.
+                    if n > self._capacity:
+                        adc = adc[-self._capacity:]
+                        voltios = voltios[-self._capacity:]
+                        relative_ts = relative_ts[-self._capacity:]
+                        ts_abs = ts_abs[-self._capacity:]
+                        n = self._capacity
+                    break
+
+            idx = self._count
+            self._timestamps[idx : idx + n] = relative_ts
+            self._signals[SIGNAL_ADC][idx : idx + n] = adc
+            self._signals[SIGNAL_VOLTIOS][idx : idx + n] = voltios
+            self._count += n
+            added = n
+
+            if self._recording:
+                self._record_timestamps.extend(ts_abs.tolist())
+                self._record_signals.setdefault(SIGNAL_ADC, []).extend(adc.tolist())
+                self._record_signals.setdefault(SIGNAL_VOLTIOS, []).extend(voltios.tolist())
 
             if added:
                 self._sample_rate_tracker.add_batch(
                     self._timestamps[self._count - 1], added
                 )
-                self._rebuild_stats_for_signal(SIGNAL_ADC)
-                self._rebuild_stats_for_signal(SIGNAL_VOLTIOS)
+                self._update_stats_from_batch(SIGNAL_ADC, added)
+                self._update_stats_from_batch(SIGNAL_VOLTIOS, added)
 
             return added
+
+    def _update_stats_from_batch(self, name: str, count: int) -> None:
+        """Actualiza estadísticas solo con las últimas muestras del lote (O(lote))."""
+        if count <= 0 or self._count == 0:
+            return
+
+        arr = self._signals[name][self._count - count : self._count]
+        valid = arr[~np.isnan(arr)]
+        if len(valid) == 0:
+            return
+
+        stats = self._signal_stats[name]
+        batch_min = float(valid.min())
+        batch_max = float(valid.max())
+        batch_sum = float(valid.sum())
+
+        stats.current = float(valid[-1])
+        stats.minimum = min(stats.minimum, batch_min) if stats.count else batch_min
+        stats.maximum = max(stats.maximum, batch_max) if stats.count else batch_max
+        stats.sum += batch_sum
+        stats.count += len(valid)
+        stats.average = stats.sum / stats.count
 
     def add_sample(self, values: Dict[str, float], recv_timestamp: Optional[float] = None) -> None:
         """
@@ -332,23 +379,58 @@ class DataBuffer:
             t_end = ts[-1] - pan_offset
             t_start = t_end - window_seconds
 
-            # Índices del rango visible.
-            mask = (ts >= t_start) & (ts <= t_end)
-            visible_ts = ts[mask]
-
-            if len(visible_ts) == 0:
+            # Búsqueda binaria sobre timestamps monótonos (O(log n)).
+            # Evita escanear todo el buffer en cada cuadro (causa del congelamiento).
+            i0 = int(np.searchsorted(ts, t_start, side="left"))
+            i1 = int(np.searchsorted(ts, t_end, side="right"))
+            n = i1 - i0
+            if n <= 0:
                 return np.array([]), {}
 
-            # Decimación para mantener fluidez en la gráfica.
-            step = max(1, len(visible_ts) // max_points)
-            visible_ts = visible_ts[::step]
+            vis_ts = ts[i0:i1]
+            vis = {name: arr[i0:i1] for name, arr in self._signals.items()}
 
-            result: Dict[str, np.ndarray] = {}
-            full_mask_indices = np.where(mask)[0][::step]
-            for name, arr in self._signals.items():
-                result[name] = arr[full_mask_indices]
+            if n <= max_points:
+                return vis_ts.copy(), {k: v.copy() for k, v in vis.items()}
 
-            return visible_ts, result
+            # Decimación min/máx (pico): conserva la forma de onda del audio.
+            # Voltios es lineal respecto a ADC, así que los picos coinciden.
+            idx = self._minmax_indices(vis[SIGNAL_ADC], n, max_points)
+            out_ts = vis_ts[idx].copy()
+            result = {name: v[idx].copy() for name, v in vis.items()}
+            return out_ts, result
+
+    @staticmethod
+    def _minmax_indices(values: np.ndarray, n: int, max_points: int) -> np.ndarray:
+        """
+        Índices que preservan el mínimo y máximo de cada tramo (decimación pico).
+
+        A diferencia de la decimación por salto (que pierde picos y dibuja líneas
+        falsas), esto mantiene la envolvente real de la señal de audio.
+        """
+        buckets = max(1, max_points // 2)
+        size = n // buckets
+        if size < 2:
+            step = max(1, n // max_points)
+            return np.arange(0, n, step, dtype=np.int64)
+
+        usable = size * buckets
+        block = values[:usable].reshape(buckets, size)
+        base = np.arange(buckets, dtype=np.int64) * size
+        amin = block.argmin(axis=1) + base
+        amax = block.argmax(axis=1) + base
+
+        # Ordenar cada par (mín, máx) en el tiempo para mantener x creciente.
+        lo = np.minimum(amin, amax)
+        hi = np.maximum(amin, amax)
+        idx = np.empty(buckets * 2, dtype=np.int64)
+        idx[0::2] = lo
+        idx[1::2] = hi
+
+        # Incluir la cola (garantiza que el último dato "vivo" se dibuje).
+        if usable < n:
+            idx = np.concatenate([idx, np.arange(usable, n, dtype=np.int64)])
+        return idx
 
     def get_stats(self) -> Dict[str, SignalStats]:
         """Devuelve una copia de las estadísticas de cada señal."""
@@ -367,7 +449,9 @@ class DataBuffer:
         Si Voltios y ADC están activos a la vez, escala solo Voltios: el ADC
         (0–1023) distorsionaría el eje y mostraría valores como 450 en voltaje.
         """
-        _, data = self.get_window(window_seconds, pan_offset, max_points=50_000)
+        from performance_config import Y_RANGE_MAX_POINTS
+
+        _, data = self.get_window(window_seconds, pan_offset, max_points=Y_RANGE_MAX_POINTS)
         if not data:
             return 0.0, 1.0
 

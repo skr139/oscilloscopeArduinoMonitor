@@ -64,8 +64,9 @@ class PlotManager(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # Configurar estilo oscuro de PyQtGraph.
-        pg.setConfigOptions(antialias=True, background="#1a1a2e", foreground="#e0e0e0")
+        # Estilo oscuro. antialias=False => mucho más rápido en tiempo real
+        # (el suavizado encarece cada redibujado con miles de puntos de audio).
+        pg.setConfigOptions(antialias=False, background="#1a1a2e", foreground="#e0e0e0")
 
         self._plot_widget = pg.PlotWidget()
         self._plot_widget.setLabel("bottom", "Tiempo", units="s")
@@ -73,8 +74,11 @@ class PlotManager(QWidget):
         self._plot_widget.showGrid(x=True, y=True, alpha=0.3)
         self._plot_widget.setMouseEnabled(x=True, y=True)
 
-        # Eje X con escala temporal legible.
+        # Optimizaciones de rendimiento de PyQtGraph.
+        self._plot_widget.setMenuEnabled(False)
+        self._plot_widget.hideButtons()
         self._plot_widget.getPlotItem().getAxis("bottom").enableAutoSIPrefix(False)
+        self._plot_widget.getPlotItem().setClipToView(True)
 
         layout.addWidget(self._plot_widget)
 
@@ -117,8 +121,12 @@ class PlotManager(QWidget):
         self._signal_colors[name] = color
         self._enabled_signals[name] = True
 
-        pen = pg.mkPen(color=color, width=2)
+        # width=1 y pintado simple => render más veloz para audio en vivo.
+        pen = pg.mkPen(color=color, width=1)
         curve = self._plot_widget.plot([], [], pen=pen, name=name)
+        # Recorta a la vista y submuestrea por picos (envolvente fiel, sin líneas falsas).
+        curve.setClipToView(True)
+        curve.setDownsampling(auto=True, method="peak")
         self._curves[name] = curve
 
     def set_signal_enabled(self, name: str, enabled: bool) -> None:

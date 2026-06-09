@@ -31,10 +31,12 @@ class SerialReaderThread(QThread):
     """
     Hilo dedicado a la lectura continua del puerto serial.
 
-    Emite cada línea recibida y detecta desconexiones o errores de comunicación.
+    Agrupa lecturas ADC en lotes para no saturar la cola de eventos de Qt
+    (un Signal por línea a 500000 baud congela la interfaz).
     """
 
-    line_received = Signal(str, float)   # (línea cruda, timestamp recepción)
+    line_received = Signal(str, float)   # Solo protocolo / mensajes no-ADC
+    samples_batch_received = Signal(list)  # [(adc, timestamp), ...]
     error_occurred = Signal(str)
     connection_lost = Signal()
 
@@ -42,6 +44,23 @@ class SerialReaderThread(QThread):
         super().__init__()
         self._port = port
         self._running = True
+        self._pending_batch: list = []
+        self._last_batch_emit = time.time()
+
+    def _emit_batch_if_ready(self, force: bool = False) -> None:
+        from performance_config import SERIAL_BATCH_INTERVAL_S, SERIAL_BATCH_MAX_SAMPLES
+
+        if not self._pending_batch:
+            return
+
+        now = time.time()
+        if not force and len(self._pending_batch) < SERIAL_BATCH_MAX_SAMPLES:
+            if now - self._last_batch_emit < SERIAL_BATCH_INTERVAL_S:
+                return
+
+        self.samples_batch_received.emit(self._pending_batch)
+        self._pending_batch = []
+        self._last_batch_emit = now
 
     def run(self) -> None:
         buffer = ""
@@ -50,6 +69,8 @@ class SerialReaderThread(QThread):
                 waiting = self._port.in_waiting
                 raw = self._port.read(waiting if waiting > 0 else 1)
                 if not raw:
+                    self._emit_batch_if_ready()
+                    self.msleep(1)
                     continue
 
                 buffer += raw.decode("utf-8", errors="replace")
@@ -57,8 +78,17 @@ class SerialReaderThread(QThread):
                 while "\n" in buffer:
                     line, buffer = buffer.split("\n", 1)
                     line = line.strip().rstrip("\r")
-                    if line:
-                        self.line_received.emit(line, time.time())
+                    if not line:
+                        continue
+
+                    ts = time.time()
+                    parsed = parse_data_line(line)
+                    if parsed is not None:
+                        self._pending_batch.append((parsed[SIGNAL_ADC], ts))
+                        self._emit_batch_if_ready()
+                    else:
+                        # Protocolo / depuración: una línea a la vez.
+                        self.line_received.emit(line, ts)
 
             except serial.SerialException as exc:
                 if self._running:
@@ -73,6 +103,7 @@ class SerialReaderThread(QThread):
     def stop(self) -> None:
         """Detiene el hilo de lectura y espera a que finalice."""
         self._running = False
+        self._emit_batch_if_ready(force=True)
         self.wait(3000)
 
 
@@ -112,7 +143,8 @@ class SerialManager(QObject):
     de comandos de texto al Arduino.
     """
 
-    data_received = Signal(dict, float)      # (valores parseados, timestamp)
+    data_received = Signal(dict, float)      # Una muestra (legado)
+    data_batch_received = Signal(list)       # [(adc, timestamp), ...]
     raw_line_received = Signal(str)          # Para la consola de depuración
     status_changed = Signal(str)             # Mensajes de estado
     connection_changed = Signal(bool)        # True = conectado
@@ -171,6 +203,7 @@ class SerialManager(QObject):
 
             self._reader = SerialReaderThread(self._port)
             self._reader.line_received.connect(self._on_line)
+            self._reader.samples_batch_received.connect(self._on_samples_batch)
             self._reader.error_occurred.connect(self.error_occurred)
             self._reader.connection_lost.connect(self._on_connection_lost)
             self._reader.start()
@@ -249,12 +282,13 @@ class SerialManager(QObject):
             return False
 
     def _on_line(self, line: str, timestamp: float) -> None:
-        """Procesa cada línea recibida del hilo de lectura."""
+        """Procesa líneas de protocolo (no datos ADC)."""
         self.raw_line_received.emit(line)
 
-        parsed = parse_data_line(line)
-        if parsed is not None:
-            self.data_received.emit(parsed, timestamp)
+    def _on_samples_batch(self, samples: list) -> None:
+        """Reenvía un lote de muestras ADC a la interfaz (un Signal por lote)."""
+        if samples:
+            self.data_batch_received.emit(samples)
 
     def _on_connection_lost(self) -> None:
         self.disconnect()

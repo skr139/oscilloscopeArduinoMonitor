@@ -13,6 +13,8 @@ import os
 from datetime import datetime
 from typing import Dict, List, Optional
 
+import numpy as np
+
 from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
@@ -44,6 +46,13 @@ from data_buffer import DataBuffer, SignalStats
 from plot_manager import PlotManager
 from serial_manager import SerialManager, list_serial_ports, parse_data_line
 from median_filter import MedianFilter
+from performance_config import (
+    MAX_PENDING_SAMPLES,
+    MAX_SAMPLES_PER_FRAME,
+    PLOT_MAX_POINTS,
+    PLOT_TIMER_MS,
+    STATS_TIMER_MS,
+)
 from signals_config import (
     DEFAULT_RIGHT_MARGIN,
     DEFAULT_VI,
@@ -93,7 +102,7 @@ class MainWindow(QMainWindow):
 
         # Cola de muestras pendientes (evita bloquear la UI con cada línea serial).
         self._pending_samples: List[tuple[float, float]] = []
-        self._max_pending_samples = 50_000
+        self._max_pending_samples = MAX_PENDING_SAMPLES
 
         self._setup_ui()
         self._setup_fixed_signal_checkboxes()
@@ -102,12 +111,12 @@ class MainWindow(QMainWindow):
         # Timer de actualización de gráfica (~30 FPS).
         self._plot_timer = QTimer()
         self._plot_timer.timeout.connect(self._refresh_plot)
-        self._plot_timer.start(33)
+        self._plot_timer.start(PLOT_TIMER_MS)
 
-        # Timer de actualización de estadísticas (~2 Hz).
+        # Timer de estadísticas (proceso secundario, más lento que la gráfica).
         self._stats_timer = QTimer()
         self._stats_timer.timeout.connect(self._refresh_stats)
-        self._stats_timer.start(500)
+        self._stats_timer.start(STATS_TIMER_MS)
 
         self._refresh_port_list()
 
@@ -534,7 +543,7 @@ class MainWindow(QMainWindow):
         self._refresh_ports_btn.clicked.connect(self._refresh_port_list)
         self._connect_btn.clicked.connect(self._on_connect)
         self._disconnect_btn.clicked.connect(self._on_disconnect)
-        self._serial.data_received.connect(self._on_data_received)
+        self._serial.data_batch_received.connect(self._on_data_batch)
         self._serial.raw_line_received.connect(self._on_raw_line)
         self._serial.status_changed.connect(self._status_bar.showMessage)
         self._serial.connection_changed.connect(self._on_connection_changed)
@@ -626,21 +635,20 @@ class MainWindow(QMainWindow):
             self._conn_status_label.setText("● Desconectado")
             self._conn_status_label.setStyleSheet("color: #ef5350; font-weight: bold;")
 
-    def _on_data_received(self, values: dict, timestamp: float) -> None:
-        # Encolar muestra; se procesa en lote en _refresh_plot (no bloquea la UI).
-        adc = values.get("ADC")
-        if adc is None:
-            return
-        self._pending_samples.append((float(adc), timestamp))
+    def _on_data_batch(self, samples: list) -> None:
+        """Encola un lote de muestras ADC (un evento Qt por lote, no por línea)."""
+        self._pending_samples.extend(samples)
         if len(self._pending_samples) > self._max_pending_samples:
-            self._pending_samples = self._pending_samples[-self._max_pending_samples:]
+            # Decimar: conservar las más recientes si el Arduino supera la capacidad.
+            step = max(1, len(self._pending_samples) // self._max_pending_samples)
+            self._pending_samples = self._pending_samples[::step][-self._max_pending_samples:]
 
     def _flush_pending_samples(self) -> None:
-        """Vuelca la cola de muestras al buffer en una sola operación."""
+        """Vuelca hasta MAX_SAMPLES_PER_FRAME muestras por cuadro."""
         if not self._pending_samples:
             return
-        batch = self._pending_samples
-        self._pending_samples = []
+        batch = self._pending_samples[:MAX_SAMPLES_PER_FRAME]
+        self._pending_samples = self._pending_samples[MAX_SAMPLES_PER_FRAME:]
         self._buffer.add_samples_batch(batch)
 
     def _on_raw_line(self, line: str) -> None:
@@ -792,17 +800,57 @@ class MainWindow(QMainWindow):
         ts, data = self._buffer.get_window(
             self._plot.window_seconds,
             self._plot.pan_offset,
+            max_points=PLOT_MAX_POINTS,
         )
+        # La escala Y se calcula con los datos YA obtenidos (los picos están
+        # preservados por la decimación min/máx), evitando re-escanear el buffer.
         y_range = None
         if self._plot.auto_y:
-            y_range = self._buffer.get_y_range(
-                self._plot.window_seconds,
-                self._plot.pan_offset,
-                enabled,
-            )
+            y_range = self._compute_y_range(data, enabled)
 
         self._update_y_axis_label(enabled)
         self._plot.update_plot(ts, data, y_range)
+
+    def _compute_y_range(self, data: dict, enabled: List[str]):
+        """Rango Y a partir de los datos visibles, sin volver a leer el buffer."""
+        if not data:
+            return None
+
+        scale = list(enabled) if enabled else list(KNOWN_SIGNALS)
+        # Si ADC y Voltios están juntos, escalar solo por Voltios
+        # (el ADC 0–1023 distorsionaría el eje en la vista de voltaje).
+        if enabled and SIGNAL_VOLTIOS in enabled and SIGNAL_ADC in enabled:
+            scale = [SIGNAL_VOLTIOS]
+
+        p = self._voltage_converter.params
+        mins: List[float] = []
+        maxs: List[float] = []
+        for name in scale:
+            arr = data.get(name)
+            if arr is None or len(arr) == 0:
+                continue
+            valid = arr[~np.isnan(arr)]
+            if len(valid) == 0:
+                continue
+            v_min = float(valid.min())
+            v_max = float(valid.max())
+            if name == SIGNAL_VOLTIOS:
+                v_min = max(p.vi, v_min)
+                v_max = min(p.vs, v_max)
+            else:
+                v_min = max(0.0, v_min)
+                v_max = min(1023.0, v_max)
+            mins.append(v_min)
+            maxs.append(v_max)
+
+        if not mins:
+            return None
+
+        y_min, y_max = min(mins), max(maxs)
+        if y_min >= y_max:
+            y_max = y_min + 0.1
+        margin = (y_max - y_min) * 0.05 or 0.1
+        return (y_min - margin, y_max + margin)
 
     def _update_y_axis_label(self, enabled: List[str]) -> None:
         """Etiqueta del eje Y acorde a la señal que se está viendo."""
@@ -819,8 +867,7 @@ class MainWindow(QMainWindow):
         self._pan_offset_label.setText(f"Offset: {self._plot.pan_offset:.1f} s")
 
     def _refresh_stats(self) -> None:
-        self._flush_pending_samples()
-
+        # No vaciar la cola aquí (lo hace el timer de gráfica) para no duplicar trabajo.
         stats = self._buffer.get_stats()
         rate = self._buffer.sample_rate_hz
         count = self._buffer.sample_count
@@ -988,8 +1035,8 @@ class MainWindow(QMainWindow):
                 self._plot_timer.stop()
                 self._stats_timer.stop()
             else:
-                self._plot_timer.start(33)
-                self._stats_timer.start(500)
+                self._plot_timer.start(PLOT_TIMER_MS)
+                self._stats_timer.start(STATS_TIMER_MS)
         super().changeEvent(event)
 
     def closeEvent(self, event) -> None:
